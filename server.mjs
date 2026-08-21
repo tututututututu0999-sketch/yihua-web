@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile, unlink, rename, copyFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { extname, join, normalize, basename, dirname } from 'node:path';
+import { extname, join, normalize, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -13,9 +13,9 @@ const dataDir = join(root, 'data');
 const uploadDir = join(root, 'uploads');
 const port = Number(process.env.PORT || 4174);
 const allowedImageTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
-// The single definition of the approved print canvases. Both front ends read it
-// from GET /shared.js instead of keeping their own copy, because a stale copy in
-// 设计工作台.html used to silently rewrite 6 of these 8 ratios.
+// The single definition of the approved print canvases. The front end reads it
+// from GET /shared.js rather than keeping its own copy, because a stale copy
+// once silently rewrote 6 of these 8 ratios.
 const printCanvasSpecs = {
   // 300 dpi print-output dimensions derived from the approved millimetre sizes.
   '32:23': { width: 3780, height: 2717, printSize: '320 x 230 mm', orientation: '横版', label: '横版 · 320 × 230 mm' },
@@ -29,11 +29,26 @@ const printCanvasSpecs = {
 };
 const canvasRatioKeys = new Set(Object.keys(printCanvasSpecs));
 const maxReferenceSize = 10 * 1024 * 1024;
+// Every role that has ever reached reference_assets. A non-string role used to
+// pass validation and only fail at the SQLite bind, after the file was already
+// on disk. Roles carry behaviour (徽章 allows two, the rest one; layout and
+// 画幅预览 drive reference ordering), so this list must stay exhaustive.
+const allowedAssetRoles = new Set(['overall_style', 'layout', 'illustration', 'palette', 'IP 参考', '徽章', '画幅预览', '风格参考', '构图参考']);
 const maxImageReferences = 8;
 const maxPromptReferenceImages = 8;
 const promptVisionPreviewEdge = 640;
+const defaultBadgeRect = { width: 15, height: 16 };
+const badgeClearancePercent = 2;
+const usePromptVision = process.env.CCPROXY_PROMPT_VISION === 'true';
+const imageEditReferenceEdge = Math.max(768, Math.min(2048, Number(process.env.CCPROXY_EDIT_REFERENCE_EDGE || 1536)));
+const maxEditReferenceImages = Math.max(1, Math.min(4, Number(process.env.CCPROXY_EDIT_REFERENCE_COUNT || 3)));
+const maxImageEditPromptLength = Math.max(1200, Math.min(2000, Number(process.env.CCPROXY_IMAGE_EDIT_PROMPT_MAX_CHARS || 2000)));
 let imageGenerationQueue = Promise.resolve();
 const execFileAsync = promisify(execFile);
+// A wedged sips would otherwise hold the single global image queue forever.
+// Resampling a 16-megapixel PNG takes seconds, and the browser already gives up
+// at 90s, so this bound cannot fail a request the user is still waiting on.
+const sipsOptions = { timeout: 60_000 };
 
 await mkdir(dataDir, { recursive: true });
 await mkdir(uploadDir, { recursive: true });
@@ -189,7 +204,10 @@ db.exec(`
 `);
 
 async function syncSuccessCasePresets() {
-  const sourceDir = join(dirname(root), '礼盒封面');
+  // Ships with the project: a tester who only unzips this folder still gets the
+  // case covers. The previous path pointed outside the project root and never
+  // resolved, so the covers survived only as leftovers in uploads/.
+  const sourceDir = join(root, '成功案例素材');
   // Built-in cases are versioned product data, so refresh them on startup.
   // User-published presets have different IDs and remain untouched.
   const insert = db.prepare(`INSERT INTO published_presets (id, name, source_project_id, source_visual_id, cover_storage_name, canvas_spec, visual_config, preview_positions, material_settings, created_at)
@@ -358,13 +376,23 @@ function send(response, status, body, contentType = 'application/json; charset=u
   response.end(payload);
 }
 
+// Decoding each chunk on its own splits any multi-byte character that straddles
+// a chunk boundary into two replacement characters, and JSON.parse still
+// succeeds — so the corruption reaches the database silently. Collect the bytes
+// first. The cap counts bytes, which for a full 10MB upload (base64 plus the
+// demand object that uploadAsset sends alongside it) needs more room than the
+// old UTF-16 unit count allowed.
+const maxRequestBytes = Math.max(16, Math.min(48, Number(process.env.YIHUA_MAX_REQUEST_MB || 24))) * 1024 * 1024;
+
 async function readJson(request) {
-  let body = '';
+  const chunks = [];
+  let size = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (body.length > 14_000_000) throw badRequest('请求内容过大');
+    size += chunk.length;
+    if (size > maxRequestBytes) throw badRequest('请求内容过大');
+    chunks.push(chunk);
   }
-  return JSON.parse(body || '{}');
+  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
 }
 
 // Every history write funnels through here, so this is the one place that can
@@ -427,7 +455,64 @@ function saveDesignRevision(projectId, demand, title = '保存需求版本') {
 
 function latestDemand(projectId) {
   const row = db.prepare('SELECT * FROM demand_snapshots WHERE project_id = ? ORDER BY created_at DESC LIMIT 1').get(projectId);
-  return row ? { ...row, payload: parse(row.payload, {}) } : null;
+  if (!row) return null;
+  const payload = parse(row.payload, {});
+  // Older badge-layout updates could leave a positions-only snapshot as the
+  // newest row. Use the latest complete visual demand, then retain its newest
+  // badge coordinates as a post-processing-only override.
+  if (String(payload.title || '').trim()) return { ...row, payload };
+  const completeRow = db.prepare("SELECT * FROM demand_snapshots WHERE project_id = ? AND json_extract(payload, '$.title') IS NOT NULL AND json_extract(payload, '$.title') != '' ORDER BY created_at DESC LIMIT 1").get(projectId);
+  if (!completeRow) return { ...row, payload };
+  const completePayload = parse(completeRow.payload, {});
+  const positions = payload.visualConfig?.textRenderConfig?.previewPositions;
+  if (positions) {
+    completePayload.visualConfig = completePayload.visualConfig || {};
+    completePayload.visualConfig.textRenderConfig = completePayload.visualConfig.textRenderConfig || {};
+    completePayload.visualConfig.textRenderConfig.previewPositions = {
+      ...(completePayload.visualConfig.textRenderConfig.previewPositions || {}),
+      ...positions
+    };
+    completePayload.visualConfig.badgeConfig = {
+      ...(completePayload.visualConfig.badgeConfig || {}),
+      ...(payload.visualConfig?.badgeConfig || {})
+    };
+  }
+  return { ...completeRow, payload: completePayload };
+}
+
+function clampPercent(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.min(100, number)) : fallback;
+}
+
+function normalizedBadgeRect(value, fallback = {}) {
+  const left = clampPercent(value?.left, fallback.left ?? 0);
+  const top = clampPercent(value?.top, fallback.top ?? 0);
+  const width = Math.max(3, Math.min(28, clampPercent(value?.width, fallback.width ?? defaultBadgeRect.width)));
+  const height = Math.max(3, Math.min(28, clampPercent(value?.height, fallback.height ?? defaultBadgeRect.height)));
+  return {
+    left: Math.min(left, 100 - width),
+    top: Math.min(top, 100 - height),
+    width,
+    height
+  };
+}
+
+function badgeReservationInstruction(bindings = {}, previewPositions = {}) {
+  const badges = [
+    { assetId: bindings.badgeAssetId, position: previewPositions.previewBadge, fallback: { left: 76, top: 6, ...defaultBadgeRect } },
+    { assetId: bindings.badgeTwoAssetId, position: previewPositions.previewBadgeTwo, fallback: { left: 6, top: 76, ...defaultBadgeRect } }
+  ].filter(item => item.assetId);
+  if (!badges.length) return '';
+  const zones = badges.map((badge, index) => {
+    const rect = normalizedBadgeRect(badge.position, badge.fallback);
+    const safeLeft = Math.max(0, rect.left - badgeClearancePercent);
+    const safeTop = Math.max(0, rect.top - badgeClearancePercent);
+    const safeRight = Math.min(100, rect.left + rect.width + badgeClearancePercent);
+    const safeBottom = Math.min(100, rect.top + rect.height + badgeClearancePercent);
+    return `徽章${index + 1}可见占位 ${Math.round(rect.left)}%—${Math.round(rect.left + rect.width)}%、${Math.round(rect.top)}%—${Math.round(rect.top + rect.height)}%；安全避让区 ${Math.round(safeLeft)}%—${Math.round(safeRight)}%、${Math.round(safeTop)}%—${Math.round(safeBottom)}%`;
+  });
+  return `【徽章后置，硬性条件】徽章由系统在生成完成后叠加，画幅预览是唯一位置来源。${zones.join('；')}。每个安全避让区内不得生成正式文字、人物、主体、卖点、图标或关键装饰；但不得创建“预留底”，原背景的渐变、纹理、图形、光感和分区边界必须自然连续穿过该区域。禁止方形、圆角、圆形、发光或边界可见的空白块，以及色块、白底、底牌、边框、阴影、认证章、飘带或任何替代装饰。`;
 }
 
 // The uploaded IP image already lives on disk as a reference_assets row, so the
@@ -502,50 +587,93 @@ function providerFailure(label, status, detail) {
   console.error(`[provider] ${label} ${status}: ${String(detail).slice(0, 2000)}`);
   if (status === 401 || status === 403) return providerError(`${label}鉴权失败（${status}）：请检查 .env 中的 CCPROXY_API_KEY 是否正确。`, status);
   if (status === 429) return providerError(`${label}触发限流（429）：请稍后重试。`, status);
-  if (status === 400 || status === 422) return providerError(`${label}被拒绝（${status}）：内容可能未通过安全审核，请调整文案或参考图后重试。`, status);
+  if (status === 400 || status === 422) {
+    const isSafetyRejection = /safety|moderation|content[ _-]?policy|policy violation|违规|审核|色情|暴力|仇恨|未成年人/i.test(String(detail));
+    return providerError(isSafetyRejection
+      ? `${label}被安全审核拒绝（${status}）：请调整文案或参考图后重试。`
+      : `${label}未接受本次请求参数（${status}）：系统会自动重试兼容格式。`, status);
+  }
   if (status >= 500) return providerError(`${label}服务端异常（${status}）：这通常是临时故障，请稍后重试。`, status);
   return providerError(`${label}失败（${status}）：详情见服务端日志。`, status);
 }
 
-async function callChatJson(system, payload, referenceImages = []) {
+async function callChatJson(system, payload, referenceImages = [], timeoutMs = Number(process.env.CCPROXY_CHAT_TIMEOUT_MS || 45000), options = {}) {
   const apiKey = process.env.CCPROXY_API_KEY;
   if (!apiKey) throw new Error('未配置 API Key。请在 .env 中填写 CCPROXY_API_KEY 后重启服务。');
-  const response = await fetchWithTimeout(providerUrl('/chat/completions'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: process.env.CCPROXY_MODEL || 'gpt-5.6-terra',
-      temperature: 0.2,
-      messages: [{ role: 'system', content: system }, {
-        role: 'user', content: referenceImages.length ? [
-          { type: 'text', text: JSON.stringify(payload) },
-          ...referenceImages.map(image => ({ type: 'image_url', image_url: { url: image.dataUrl } }))
-        ] : JSON.stringify(payload)
-      }]
-    })
-  }, Number(process.env.CCPROXY_CHAT_TIMEOUT_MS || 75000), '方案模型调用');
-  if (!response.ok) throw providerFailure('方案模型调用', response.status, await response.text());
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error('方案模型未返回可读取的内容。');
-  return parseModelJson(content);
+  const endpoint = providerUrl('/chat/completions');
+  const messages = [{ role: 'system', content: system }, {
+    role: 'user', content: referenceImages.length ? [
+      { type: 'text', text: JSON.stringify(payload) },
+      ...referenceImages.map(image => ({ type: 'image_url', image_url: { url: image.dataUrl } }))
+    ] : JSON.stringify(payload)
+  }];
+  const tokenLimit = Math.max(160, Math.min(900, Number(options.tokenLimit || process.env.CCPROXY_CHAT_MAX_TOKENS || 900)));
+  const model = String(options.model || process.env.CCPROXY_MODEL || 'gpt-5.6-terra');
+  const jsonFormatBodies = [
+    { model, temperature: 0.2, max_tokens: tokenLimit, response_format: { type: 'json_object' }, messages },
+    { model, temperature: 0.2, max_completion_tokens: tokenLimit, response_format: { type: 'json_object' }, messages }
+  ];
+  const plainJsonBody = { model, temperature: 0.2, max_tokens: tokenLimit, messages };
+  // Some compatible providers accept the chat request but stall on OpenAI's
+  // response_format. Prompt Skills already require JSON in their system text,
+  // so use the verified plain chat format first for this latency-sensitive path.
+  const requestBodies = options.preferPlainJson ? [plainJsonBody, ...jsonFormatBodies] : [...jsonFormatBodies, plainJsonBody];
+  let lastStatus = 0;
+  let lastDetail = '';
+  for (let index = 0; index < requestBodies.length; index += 1) {
+    const response = await fetchWithTimeout(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(requestBodies[index])
+    }, timeoutMs, '方案模型调用');
+    if (response.ok) {
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) {
+        lastStatus = response.status;
+        lastDetail = '模型返回空内容';
+        continue;
+      }
+      try {
+        return parseModelJson(content);
+      } catch (error) {
+        lastStatus = response.status;
+        lastDetail = `模型返回内容不是有效 JSON：${error.message}`;
+        continue;
+      }
+    }
+    lastStatus = response.status;
+    lastDetail = await response.text();
+    if (![400, 422].includes(response.status)) break;
+  }
+  throw providerFailure('方案模型调用', lastStatus, lastDetail);
 }
 
-const mainVisualBasePositive = '教育互联网礼盒封面，高明度高对比，印刷级清晰；标题、主体、卖点层级清楚，留白干净；核心主体四周保留与相邻背景同风格、同色系的呼吸余量，不做贴边满版。';
+const mainVisualBasePositive = '教育互联网礼盒封面，高明度、清透明快、印刷级清晰；标题、主体、卖点层级清楚，留白干净；全画面采用干净平面图形语言，不使用纸张颗粒、脏灰渐变或厚重材质；核心主体四周至少保留其宽度 12% 的呼吸余量，余量与相邻背景同风格、同色系，不做贴边满版。';
 const materialBasePositive = '明亮清晰的教育系列物料，继承主视觉配色与图形语言，信息层级更轻。';
-const commonNegativePrompt = '灰暗低饱和，模糊，乱码错字，任何未填写的文字或数字，Logo，水印，重绘徽章，拥挤背景，多主体，遮挡标题，裁切出血。';
+const commonNegativePrompt = '灰暗低饱和，脏灰渐变，纸张颗粒，厚重材质，模糊，乱码错字，任何未填写的文字或数字，Logo，水印，重绘徽章，拥挤背景，多主体，遮挡标题，裁切出血。';
 
 const proposalSkill = `你是资深视觉提示词规划专家。先准确理解用户需求并提取可执行约束；你是教辅造品平台的“主视觉方案完善 Skill”。根据需求、业务规则和参考图元数据，输出给设计师确认的主视觉方案。
 规则：不要生成图片，不承诺生产文件；参考图只可提炼风格、构图、元素，不能复制其中标题、卖点或未授权内容；不确定内容必须列入待确认项。
 严格只返回 JSON：{"summary":"","designGoal":"","informationHierarchy":[""],"palette":[""],"coreElements":[""],"layout":"","executableConstraints":[""],"referenceAnalysis":[""],"risks":[""],"questions":[""]}`;
 
 const promptSkill = `你是教辅礼盒封面 Prompt Skill。依据已确认文案、网站选项、拖拽版式和参考图，输出可直接用于生图的中文补充词。
-规则：只写输入未覆盖的主体、装饰、材质和画面气质；不重复文案、画幅、配色、版式字段。只允许呈现“已确认文案”中的文字、数字和英文，严禁自行增加任何标题、口号、标签、认证、数字或英文。参考图只继承角色特征、配色、构图和图形语言，不复制旧文案、Logo、徽章或未授权角色。徽章和 Logo 必须后置，徽章预留区必须自然延续周围背景的颜色、纹理和风格，不能生成独立色块、白底、底牌、认证章、飘带或替代图形。主体四周必须留出与相邻背景同风格同色系的呼吸余量，不得贴边或满版。画面高明度、高对比、干净明亮，拒绝灰暗电影感。positivePrompt 控制在 120 至 220 个汉字；integratedPrompt 写成一段完整的“制作一张……”整合版生图提示词，串联当前画幅、正式文案、配色、版式、主体、装饰、留白和氛围；negativePrompt 仅保留必要禁用项。
-严格只返回 JSON：{"positivePrompt":"","integratedPrompt":"","negativePrompt":"","size":"","titleText":"","keepItems":[""],"changeItems":[""],"referenceInstructions":[""]}`;
+目标：生成具有完整教育营销层级的课程礼盒封面。以主标题建立第一注意力，副标题或年级标签建立第二信息层，主体与视觉元素形成第三视觉层，卖点作为可快速扫读的转化层；所有层级必须由对齐、留白、色彩与动线连接。
+规则：只补充主体、装饰、材质和气质，不重复输入字段；严格只用已确认文案中的文字、数字和英文，不新增任何文字、Logo、徽章或认证。参考图仅继承角色、配色、构图与图形语言。徽章后置：预留位置不是单独色块，背景渐变、纹理、图形和分区边界必须连续穿过该位置；只留无文字无图标区域，禁止生成方形、圆角、圆形、发光或颜色不同的底板。主体四周保留至少 12% 同风格背景余量；卖点水平居中并遵循统一对齐网格。配色严格采用输入的五角色明亮色系：主色为大背景，浅底承接信息，辅助色做层次，强调色仅点关键词/数字，深锚点只用于描边与关键文字；必须逐项写出输入的色值与用途，不得改成通用红黄蓝或擅自换色。当卖点样式禁止图标或背景色块时，严格遵守该限制。输入中的“补充设计说明”仅是设计意图，必须先由你提炼、润色并扩展成可执行的画面关系、层级、装饰密度与质感要求，禁止原样照抄；扩展内容写入 positivePrompt。默认干净平面图形语言，禁止纸张颗粒、脏灰、重金属与厚重材质。若选择烫箔，仅在标题、数字或细边框做明亮平面假烫金/银渐变，不做镜面或立体金属。positivePrompt 120—240 字；服务端最终整合为唯一 Prompt，必须保留完整关键约束且少于 2000 字；negativePrompt 只保留必要禁用项。
+严格只返回 JSON：{"positivePrompt":"","negativePrompt":"","size":"","titleText":"","keepItems":[""],"changeItems":[""],"referenceInstructions":[""]}`;
 
-const materialPromptSkill = `你是教辅礼盒系列延展物料 Prompt Skill。继承已确认主视觉的明亮配色、图形语言和主体身份，重组为独立版式；非主书物料的信息层级弱于主书。
-规则：只写输入未覆盖的画面内容，不重复网站字段。只允许呈现“已确认文案”中的文字、数字和英文，严禁自行增加标题、口号、标签、认证或英文。徽章和 Logo 必须后置，预留区自然延续周围背景，不能另加色块或徽章替代图形；主体四周保留与背景一致的呼吸余量；参考图不复制旧文案、Logo、徽章或未授权角色。画面高明度、高对比、干净明亮。positivePrompt 控制在 120 至 220 个汉字；integratedPrompt 写成一段完整的“制作一张……”整合版生图提示词；negativePrompt 仅保留必要禁用项。
-严格只返回 JSON：{"positivePrompt":"","integratedPrompt":"","negativePrompt":"","size":"","titleText":"","keepItems":[""],"changeItems":[""],"referenceInstructions":[""]}`;
+// A smaller recovery request keeps the Skill available when the provider is
+// congested. The server still merges its result with the full saved contract.
+const promptSkillRecovery = `你是教辅礼盒封面 Prompt Skill 的快速恢复模式。只根据输入约束，输出 120—180 字中文画面补充词；不得新增正式文字、数字、Logo、徽章或认证，不重复文案。设计说明需改写为可见的层级、对齐、装饰密度与质感关系。只返回 JSON：{"positivePrompt":"","negativePrompt":""}`;
+
+const paletteSkill = `你是教育课程礼盒的色彩策划师。根据用户输入的色调意图，生成一套清透明亮、适合印刷和屏幕预览的五角色色板。
+角色：主色用于大背景；辅助色用于局部图形层次；强调色用于关键词和数字；浅底色用于信息区缓冲；深锚点色用于描边、关键文字和局部阴影。
+规则：避免脏灰、暗沉、荧光刺眼与强互补大面积冲突；主色 45%—60%、浅底 20%—30%、辅助 10%—20%、强调 5%—10%、深锚点不超过 8%。仅输出合法 6 位十六进制色值，浅底必须足够明亮，深锚点必须足够深。
+严格只返回 JSON：{"name":"","hint":"","primary":"#000000","secondary":"#000000","accent":"#000000","light":"#000000","anchor":"#000000"}`;
+
+const materialPromptSkill = `你是教辅礼盒系列延展物料 Prompt Skill。继承已确认主视觉的明亮五角色配色、图形语言和主体身份，重组为独立版式；非主书物料弱于主书。
+规则：只补充未覆盖画面内容；严格只用已确认文案中的文字、数字和英文，不新增 Logo、认证或文字。徽章后置且预留区必须是背景的连续部分：原有渐变、纹理、图形和分区边界无缝穿过，不创建独立的纯色色块、白底、底牌、发光块或其他边界可见区域；主体四周保留至少 12% 同风格余量；模块沿统一对齐网格。主色、浅底、辅助、强调、深锚点严格按输入色板面积与用途分配，必须逐项写出输入色值，拒绝脏灰、纸张颗粒和厚重金属；烫箔只可用于局部明亮平面渐变。输入中的“补充设计说明”必须先由你提炼、润色并扩展成可执行的画面关系、层级、装饰密度与质感要求，禁止原样照抄；扩展内容写入 positivePrompt。positivePrompt 120—240 字；服务端最终整合为唯一 Prompt，必须保留完整关键约束且少于 2000 字；negativePrompt 只留必要禁用项。
+严格只返回 JSON：{"positivePrompt":"","negativePrompt":"","size":"","titleText":"","keepItems":[""],"changeItems":[""],"referenceInstructions":[""]}`;
 
 const styleProfileSkill = `你是资深视觉提示词规划专家。先准确理解用户需求并提取可执行约束；你是教辅造品平台的“风格规则提炼 Skill”。根据一张已确认的礼盒主视觉及其 Prompt，输出只供后续主书、练习册继承的可编辑风格规则。
 规则：不能声称生成生产文件；只描述色彩、标题气质、核心元素、版式留白和禁用项；不得复制图片中不属于当前项目的旧标题或卖点。
@@ -566,7 +694,7 @@ async function loadPromptVisionPreviews(assets) {
   const previews = await Promise.all(selected.map(async asset => {
     const preview = join(uploadDir, `.prompt-preview-${randomUUID()}.jpg`);
     try {
-      await execFileAsync('sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '65', '-Z', String(promptVisionPreviewEdge), join(uploadDir, asset.storage_name), '--out', preview]);
+      await execFileAsync('sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '65', '-Z', String(promptVisionPreviewEdge), join(uploadDir, asset.storage_name), '--out', preview], sipsOptions);
       const bytes = await readFile(preview);
       return { dataUrl: `data:image/jpeg;base64,${bytes.toString('base64')}` };
     } catch {
@@ -611,7 +739,7 @@ function quickProposal(demand) {
 
 function sanitizePrompt(result) {
   return {
-    positivePrompt: compactPositivePrompt(String(result.positivePrompt || '')), integratedPrompt: compactIntegratedPrompt(String(result.integratedPrompt || '')), negativePrompt: String(result.negativePrompt || ''),
+    positivePrompt: compactPositivePrompt(String(result.positivePrompt || '')), negativePrompt: String(result.negativePrompt || ''),
     size: /^\d{3,5}x\d{3,5}$/.test(String(result.size || '')) ? String(result.size) : '1024x1364', titleText: String(result.titleText || ''),
     canvasSpec: result.canvasSpec && typeof result.canvasSpec === 'object' ? result.canvasSpec : null,
     keepItems: Array.isArray(result.keepItems) ? result.keepItems.map(String) : [],
@@ -626,13 +754,50 @@ function compactPositivePrompt(value) {
   return unique.join('；').slice(0, 260);
 }
 
-function compactIntegratedPrompt(value) {
-  return value.replace(/\s+/g, ' ').trim().slice(0, 760);
+function removeVerbatimDesignNote(value, designNote) {
+  const source = String(designNote || '').trim();
+  if (!source) return compactPositivePrompt(String(value || ''));
+  const refined = String(value || '').split(source).join('').replace(/\s{2,}/g, ' ').trim();
+  return compactPositivePrompt(refined);
 }
 
-function layoutComponentModules(config, points, previewPositions = {}) {
+function explicitLayoutInstruction(designNote) {
+  const note = String(designNote || '').replace(/\s+/g, '');
+  const mentionsTitleAndIllustration = /(标题.*插画|插画.*标题|文字.*插画|插画.*文字)/.test(note);
+  if (mentionsTitleAndIllustration && /左右居中/.test(note)) {
+    return '【设计说明版式覆盖，硬性条件】设计说明明确要求“标题和插画左右居中”：标题固定在画面左半区的视觉中部，插画固定在画面右半区的视觉中部；两者分别以各自半区中轴对齐，形成左右均衡的双主体关系。不得将插画单独描述或改成右侧中部主视觉，也不得继续沿用与此冲突的旧画幅锚点。';
+  }
+  if (mentionsTitleAndIllustration && /(居中|中心|中轴)/.test(note)) {
+    return '【设计说明版式覆盖，硬性条件】设计说明明确要求“标题和插画要居中”：主标题与副标题必须沿画面总中轴水平居中；插画主体也必须以画面总中轴为中心，位于标题下方的中部或中下部，形成纵向居中的单轴构图。不得将主体偏向左侧或右侧，不得使用右侧中部主体、左右分栏或偏右视觉重心。该要求覆盖与其冲突的旧画幅锚点。';
+  }
+  return '';
+}
+
+function removeConflictingLayoutWording(value, designNoteLayout) {
+  let output = String(value || '');
+  if (!designNoteLayout) return compactPositivePrompt(output);
+  if (/标题和插画要居中/.test(designNoteLayout)) {
+    output = output
+      .replace(/[；，、]?(?:主体|插画|主视觉)(?:偏向?|位于)?(?:画面)?(?:左侧|右侧|偏右|偏左)(?:中部|中|视觉重心)?[^；。\n]*/g, '')
+      .replace(/(?:主体|插画)偏右中但视觉重心居中/g, '');
+  }
+  return compactPositivePrompt(output);
+}
+
+function layoutComponentModules(config, points, previewPositions = {}, referenceAssets = [], designNoteLayout = '') {
   const component = config.layoutComponentConfig || {};
   const label = (value, map, fallback) => map[value] || fallback;
+  const placementFromPreview = (id, name, widthPercent = 0) => {
+    const value = previewPositions[id] || {};
+    const left = Number(value.left);
+    const top = Number(value.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    const centerX = Math.max(0, Math.min(100, left + widthPercent / 2));
+    const centerY = Math.max(0, Math.min(100, top));
+    const horizontal = centerX < 38 ? '画面左侧' : centerX > 62 ? '画面右侧' : '画面中部';
+    const vertical = centerY < 34 ? '上方' : centerY > 66 ? '下方' : '中部';
+    return `${name}位于${horizontal}${vertical}，锚点@${Math.max(0, Math.min(100, left)).toFixed(0)}%,${centerY.toFixed(0)}%`;
+  };
   const position = (id, name) => {
     const value = previewPositions[id] || {};
     const left = Number(value.left);
@@ -647,6 +812,13 @@ function layoutComponentModules(config, points, previewPositions = {}) {
     position('previewSelling', '卖点区'),
     position('previewIp', '主体')
   ].join('；');
+  const ipScale = Math.max(80, Math.min(220, Number(config.illustrationConfig?.ipScale) || 100));
+  const previewPlacement = [
+    placementFromPreview('previewTitle', '主标题'),
+    placementFromPreview('previewSub', '副标题'),
+    placementFromPreview('previewSelling', '卖点区', 74),
+    placementFromPreview('previewIp', '主体', 30 * ipScale / 100)
+  ].filter(Boolean).join('；');
   // Dragged preview coordinates are the source of truth. compositionTemplate remains
   // only as a fallback for saved projects created before position dragging existed.
   const legacyComposition = label(component.compositionTemplate, {
@@ -734,20 +906,23 @@ function layoutComponentModules(config, points, previewPositions = {}) {
     side_rail: '卖点组件沿左右一侧的垂直侧栏排布',
     none: '不生成卖点组件或空白卖点卡'
   }, '卖点组件位于独立且不遮挡标题的位置');
-  const sellingStyle = label(component.sellingStyle, {
-    short_phrase_row: '卖点以短句横向并排呈现，无卡片、无图标；使用中点、竖线或留白分隔',
-    rounded_capsules: '每条卖点使用同尺寸圆角胶囊承载，纯文字，不添加 icon；胶囊内边距一致',
-    three_column_ribbon: '卖点使用三栏并列标签条承载，每栏包含一条短卖点，使用细竖线或留白分隔，不添加 icon',
-    promise_strip_columns: '先用一条横向承诺短条承载课程范围或核心价值，再在其下方并列三栏短卖点；承诺条比底栏更醒目',
-    split_metric_bar: '卖点置于连续的底部横向数据条中，按数量均分，每项由大数字、单位和两行以内说明组成，使用细竖线分隔，不使用独立卡片',
-    equal_data_cards: '每条卖点使用等宽矩形数据卡承载；数字最大，单位紧贴数字，说明置于下方，卡片间距和高度一致',
-    icon_number_cards: '每条卖点使用图标加大数字的信息卡承载；图标表达课程事实，数字大于说明，所有图标统一风格与尺寸',
-    icon_number_pills: '每条卖点使用白底或浅色圆角数字胶囊承载；左侧或上方放简洁图标，数字高对比突出，说明紧随数字',
-    centered_number_cluster: '所有卖点置于同一个中心信息板内，以两行或三行对齐的数字簇呈现；数字上大下小，说明置于数字下方，无独立卡片',
-    grid_paper_metric_cards: '底部使用浅色方格纸信息带，卖点为红色或深色大数字加黑色说明，模块间由细线或花括号分隔',
-    laurel_medallions: '每条卖点使用完整圆形月桂圆章承载，月桂围合文字，圆章尺寸与间距一致，适合三项权威卖点',
-    laurel_stat_row: '每条卖点使用左右分开的月桂枝承托大数字，中心不做封闭圆章；数字最大，说明位于下方，适合四至五项数据',
-    window_modules: '卖点以四个或五个等宽场景窗口呈现；每个窗口含一幅统一画风的小场景或图形，下方仅放一个模块短标题'
+  const sellingStyleKey = ({
+    short_phrase_row: 'selling_line_frame', rounded_capsules: 'selling_sandwich_strip', three_column_ribbon: 'selling_topic_explainer',
+    promise_strip_columns: 'selling_topic_explainer', split_metric_bar: 'selling_sandwich_strip', equal_data_cards: 'selling_numeric_vertical',
+    icon_number_cards: 'selling_icon_benefit', icon_number_pills: 'selling_icon_benefit', centered_number_cluster: 'selling_numeric_vertical',
+    grid_paper_metric_cards: 'selling_numeric_vertical', laurel_medallions: 'selling_laurel_honor', laurel_stat_row: 'selling_laurel_honor',
+    window_modules: 'selling_topic_explainer'
+  })[component.sellingStyle] || component.sellingStyle;
+  const sellingStyle = label(sellingStyleKey, {
+    selling_numeric_vertical: 'A｜纵向数字主导：每项采用接近正方形或竖向单元，超大核心数字居上并占约半高，下方居中放一至两行简短说明；多项等宽横向并列，四周留白均衡。仅模块本身可用主色或浅底色，模块外不新增背景色块；不添加图标',
+    selling_number_unit_badge: 'B｜数字＋单位徽标：正方形或竖向卡片中大数字位于上部中心，单位紧贴数字右上方并独立做成小圆章或小胶囊，下方放说明；数字、单位、说明形成紧凑数字组。仅单位徽标可用反色或浅底色，不添加其他图标或额外色块',
+    selling_laurel_honor: 'C｜月桂对称荣誉：左右两支开放式月桂向内环抱中心数字或短卖点，所有信息严格沿中轴对称；月桂只作边界不抢主体，不使用封闭卡片。背景仅使用当前主色或浅底色自然承托，不新增独立卖点底板，不添加图标',
+    selling_number_label: 'D｜左数字右标签：横向长条按约 1:2 分为左侧大数字区和右侧权益区；右侧以胶囊或短牌签承载核心标签，标签下可补一行短说明，按左到右阅读',
+    selling_icon_benefit: 'E｜图标＋两行权益：横向组件左侧使用一个简洁图标或头像容器，右侧垂直排列“数字与单位”及“服务说明”两行，整体沿垂直中线对齐；图标仅服务识别，不添加第二个图标、装饰图标或无关文字；不额外添加卖点色块底板',
+    selling_medal_arc: 'F｜奖章／弧形认证：正方形或竖向单元以中心数字或短成果为绝对焦点，上方放弧形引导语，下方放短说明或少量星形，必要时配细月桂形成开放式认证章；仅该认证单元使用主色背景与环绕装饰，不添加图标或额外卖点底板',
+    selling_sandwich_strip: 'G｜横向夹心腰封：宽扁圆角长条由左侧固定宽度的数量块与右侧延展说明带连接构成，中间用直切、轻斜切或小凹口衔接；多条上下等距堆叠并统一左右边线',
+    selling_line_frame: 'H｜线框夹标题：横向单条强卖点居中，上下以两条等长细线夹住主信息，下线中心可有小型 V 形凹角；整体严格对称，不加入图标、卡片或背景色块，保持纯净高对比背景',
+    selling_topic_explainer: 'I｜标题标签＋解释文案：先用紧凑色块标签标记专题或方法，再连接一行主描述及下一行较弱补充解释；标签与主描述距离更近，整体统一左对齐或居中。只有标签允许使用色块，主描述和解释区不得额外加背景色块或图标'
   }, '卖点使用统一组件样式承载');
   const sellingArrangement = label(component.sellingArrangement, {
     columns: '所有卖点必须按当前条数横向等宽分栏：三条为三栏、四条为四栏；每条独立占位，不得合并为一段文字',
@@ -756,30 +931,55 @@ function layoutComponentModules(config, points, previewPositions = {}) {
     stack: '卖点拆分为纵向列表，每条独立成行，不合并为大段文字'
   }, '所有卖点按当前条数横向等宽分栏，每条独立占位');
   const countInstruction = `卖点组件数量严格等于当前 ${points.length} 条卖点的行数，每条卖点各占一个组件，不得合并、遗漏或编造。`;
-  const hardLayout = `【版式】${draggedLayout}；标题${titleLayout}、${titleColor}；主体${subjectPlacement}、${subjectCrop}；背景${background}，分区${backgroundPosition}%；卖点${sellingPlacement}、${sellingStyle}、${sellingArrangement}，严格${points.length}条。\n【留白与文字安全区，硬性条件】主视觉主体四周至少保留其宽度 8% 的呼吸余量，余量必须连续使用相邻背景的同色系、同纹理、同光感，不得改成白边、边框或额外色块；所有正式文字距画幅边缘至少 6%，标题、副标题与卖点组件彼此至少保留 1.5 个字高的净空；每个卖点组件内边距不少于组件高度的 14%，不得贴边、拥挤、互相遮挡或被裁切。`;
-  const stylesWithIcons = new Set(['icon_number_cards', 'icon_number_pills', 'window_modules']);
+  const iconRule = sellingStyleKey === 'selling_icon_benefit' ? '仅 E 类左侧保留一个简洁服务识别图标，其余区域不得添加图标。' : '本结构未定义图标，禁止添加任何图标、头像容器、符号图标或装饰性小图形。';
+  const backgroundRule = ({
+    selling_numeric_vertical: '仅每个竖向数字单元可用主色或浅底色，单元外不增加色块。',
+    selling_number_unit_badge: '仅单位小圆章或小胶囊可用反色或浅底色，其他区域不加色块。',
+    selling_laurel_honor: '只用当前主色或浅底色自然承托月桂结构，不增加独立卡片或底板。',
+    selling_number_label: '仅右侧权益标签可用浅底色或反色，数字区与说明区不额外加底板。',
+    selling_icon_benefit: '背景保持高对比，不额外添加卖点色块底板。',
+    selling_medal_arc: '仅认证单元可用主色背景和环绕装饰，不增加额外底板。',
+    selling_sandwich_strip: '仅左数量块与右说明带构成腰封色块，不增加第三层背景。',
+    selling_line_frame: '背景必须保持纯净高对比，不添加任何背景色块。',
+    selling_topic_explainer: '仅专题标签可用紧凑色块，主描述与解释区不加背景。'
+  })[sellingStyleKey] || '不添加额外卖点背景色块。';
+  const sellingModule = `【卖点结构，硬性条件】位置：${sellingPlacement}。选用${sellingStyle}。排布：${sellingArrangement}。当前 ${points.length} 条卖点必须逐条套用该结构，不得改成通用卡片、胶囊、纯文字横排或其他卖点样式；不得省略、合并、增加或替换卖点。${iconRule}${backgroundRule}`;
+  const alignmentModule = '【对齐，硬性条件】所有正式模块遵循同一对齐网格：标题与副标题共用同一主对齐轴；卖点区默认以画面水平中心为轴左右居中，卖点组件整体等宽、等距、边缘齐平；主体、标题和卖点之间保留清晰层级与稳定间距，不得出现无依据的错位、漂移或参差边线。';
+  const hasLayoutReference = referenceAssets.some(asset => (Array.isArray(asset?.role) ? asset.role : [asset?.role]).includes('layout'));
+  const previewLayoutSource = hasLayoutReference
+    ? `【版式，画幅预览与版面位置参考图共同约束】当前画幅预览决定本项目正式文字、主体和卖点的拖拽锚点：${previewPlacement || draggedLayout}。上传的版面位置参考图决定大色块分区、模块比例、标题/主体/卖点的相对关系、图形承托和阅读动线；不得改成另一套通用模板。两者有差异时，以画幅预览校正本项目元素落点，以版面位置参考图保留结构关系与视觉节奏。`
+    : `【版式，画幅预览为位置来源】必须严格复现当前画幅预览的拖拽位置：${previewPlacement || draggedLayout}。不得使用或反转旧构图、标题位置、主体位置或人物裁切字段。`;
+  const layoutSource = designNoteLayout || previewLayoutSource;
+  const hardLayout = `${layoutSource}标题${titleLayout}、${titleColor}；背景${background}，分区${backgroundPosition}%。\n${alignmentModule}\n${sellingModule}\n【留白与文字安全区，硬性条件】主视觉主体四周至少保留其宽度 12% 的呼吸余量，余量必须连续使用相邻背景的同色系、同纹理、同光感，不得改成白边、边框或额外色块；所有正式文字距画幅边缘至少 6%，标题、副标题与卖点组件彼此至少保留 1.5 个字高的净空；每个卖点组件内边距不少于组件高度的 14%，不得贴边、拥挤、互相遮挡或被裁切。`;
   const negative = [
     '不得改写、遗漏或编造已确认文案',
     '不得添加已确认文案以外的文字、数字、英文或认证标签',
-    '徽章预留区必须延续周围背景风格与颜色，不添加独立色块、白底、底牌、认证章、飘带或Logo',
-    !stylesWithIcons.has(component.sellingStyle) ? '卖点不加图标' : '',
-    component.sellingStyle === 'laurel_medallions' ? '月桂圆章不换成卡片' : '',
-    component.sellingStyle === 'split_metric_bar' ? '连续数据条不拆成卡片' : '',
+    '徽章预留区不是独立画面：背景的渐变、纹理、图形和分区边界必须连续穿过该位置；不创建方形、圆角、圆形或任何边界可见的空白块，不添加独立色块、白底、底牌、光晕、认证章、飘带或Logo',
+    sellingStyleKey !== 'selling_icon_benefit' ? '卖点不加任何图标、头像容器或装饰符号' : '',
+    sellingStyleKey === 'selling_laurel_honor' ? '月桂必须开放对称，不换成封闭卡片' : '',
+    sellingStyleKey === 'selling_sandwich_strip' ? '夹心腰封保持左数量块、右说明带，不拆成数据卡片' : '',
     component.personPlacement === 'none' ? '不生成人物' : '',
     component.sellingPlacement === 'none' ? '不生成卖点组件' : ''
   ].filter(Boolean).join('；');
-  return { hardLayout, negative };
+  const imageLayout = `${layoutSource}标题${titleLayout}、${titleColor}；${background}。卖点位于${sellingPlacement}，严格使用${sellingStyle}；${sellingArrangement}；${countInstruction}${iconRule}${backgroundRule}。标题、副标题与卖点遵循同一对齐轴，主体与文字不互相遮挡。`;
+  return { hardLayout, imageLayout, sellingModule, negative, designNoteLayout };
 }
 
 function promptModules(demand, materialType, edits = {}) {
   const facts = demand.projectFacts || {};
   const config = demand.visualConfig || {};
+  const previewPositions = config.textRenderConfig?.previewPositions || demand.textRenderConfig?.previewPositions || {};
   const illustration = config.illustrationConfig || {};
   const decoration = config.decorationConfig || {};
   const photoSubject = illustration.assetType === 'teacher_photo' || illustration.subjectType === 'teacher_photo';
   const colorLabels = {
     red: '珊瑚红 #FF4D4F', deep_red: '明快绯红 #E53935', orange: '活力橙 #FF8A34', yellow: '明黄 #FFC83D', green: '薄荷绿 #32B768', cyan: '清透湖蓝 #22B8CF', blue: '互联网蓝 #2F80ED', navy: '亮学院蓝 #1D5FD1', purple: '活力紫 #7B61FF',
     white: '白色', champagne_gold: '亮香槟金 #E6B85C', silver: '亮银灰 #B8C4D6', black_gold: '深墨黑配亮金点缀', white_gold: '白金', none: '自动推荐高明度辅助色，与主色形成清晰对比'
+  };
+  const paletteNames = {
+    academy_blue_yellow: '蓝黄学院调', orange_blue_energy: '橙蓝活力调', red_apricot_promo: '红杏轻促销调', purple_orange_fun: '紫橙趣味调',
+    blue_gold_foil: '蓝金书卷调', teal_yellow_fresh: '青绿暖黄调', ai_generated: 'AI 色调生成色板', custom: '自定义柔和同系色板',
+    red: '红杏轻促销调', orange: '橙蓝活力调', green: '青绿暖黄调', blue_silver_foil: '蓝黄学院调'
   };
   const visualPreferenceLabels = {
     playful_lively: '童趣活泼', growth_motivation: '成长激励', professional_reliable: '专业可信', exploration_thinking: '探索思考',
@@ -792,7 +992,19 @@ function promptModules(demand, materialType, edits = {}) {
     medium: '中营销感：标题与卖点对比更强、视觉动线更明确，但保持专业可读',
     high: '强营销感：高对比、大标题、强动势与卖点优先，用于强化转化注意力'
   };
-  const titleStyleLabels = { rounded_playful: '圆润童趣粗体', block_building: '粗圆积木标题', geometric_modern: '超粗几何黑体', condensed_speed: '窄体冲刺标题', scholarly_culture: '书卷文化标题', inflated_3d: '圆润立体膨胀标题' };
+  const legacyTitleStyleMap = { rounded_playful: 'title_rounded_outline', block_building: 'title_massive_blocks', geometric_modern: 'title_flat_book', condensed_speed: 'title_diagonal_sprint', scholarly_culture: 'title_flat_book', inflated_3d: 'title_round_print' };
+  const titleStyleKey = legacyTitleStyleMap[config.titleTypographyConfig?.titleStyle] || config.titleTypographyConfig?.titleStyle;
+  const titleStyleLabels = {
+    title_rounded_outline: '圆润厚描边：圆润膨胀大体块，字面、粗描边、同方向平移阴影三层叠加；可上下错位交叠，保持玩具包装般扁平矢量层次',
+    title_flat_book: '平面书卷字：单行或上下两层巨型平整标题，边缘干净，几乎不使用描边或阴影，仅用主标题与小级别副层建立端正层次',
+    title_grand_whitespace: '大字留白：低纹理背景中央突出主标题，极细轮廓配大面积负空间；辅助层级缩小并远离标题，舞台式聚焦且克制',
+    title_massive_blocks: '巨幅分块：超大紧凑标题按关键词拆为二至三个扁平体块，同级或错位基线排列；下方以明显缩小的次标题承接，不使用渐变',
+    title_round_print: '粗圆印刷：两行或多行宽胖规则圆角字块，字面外包统一粗轮廓，并配同方向小面积平移阴影，形成亲和的扁平贴纸层次',
+    title_vertical_cover: '竖排书封：主标题按单字或双字自上而下纵向拆分，占窄竖画幅大部分高度；上方小型分类层，右侧仅保留低权重系列信息',
+    title_diagonal_sprint: '斜切冲刺：主标题拆为两组并沿同一斜向运动轴推进，一组实心强重音、一组轮廓体；次标题保持同倾角，阴影仅用薄而明确的平移色块',
+    title_frame: '框体标题：核心标题置入完整大形框体或牌匾，框体、主标题、次级标题由外向内形成三层聚焦；依靠平面框体分离，不使用立体材质'
+  };
+  const titleStyleConstraint = `【标题结构，硬性条件】采用${titleStyleLabels[titleStyleKey] || titleStyleLabels.title_rounded_outline}。所有标题必须为扁平矢量字效，不使用 3D 立体字、金属材质、玻璃质感、发光字、写实投影或渐变字面。`;
   const titleWeightLabels = { regular: '常规字重', medium: '中等字重', bold: '粗体', extra_bold: '特粗字重', black: '超粗字重' };
   const illustrationStyleLabels = {
     flat_geometric: '明亮扁平几何插画', picture_book: '高明度绘本插画', three_d_toy_render: '高品质明亮 3D 玩具渲染', watercolor: '明亮水彩插画', graphic_poster: '高对比海报图形', photographic_portrait: '清晰自然的授权讲师肖像',
@@ -809,6 +1021,13 @@ function promptModules(demand, materialType, edits = {}) {
     unrolled_scroll: '展开画卷：作为文化课程主题元素，展示展开卷轴或纸卷意象'
   };
   const colorLabel = (value, customValue) => value === 'custom' ? `自定义色 ${customValue || ''}`.trim() : colorLabels[value] || value || '未指定';
+  const palette = config.colorConfig?.palettePreset;
+  const paletteColor = (label, value) => value ? `${label} ${value}` : '';
+  const hasDerivedPalette = Boolean(config.colorConfig?.primaryCustomColor && config.colorConfig?.secondaryCustomColor && config.colorConfig?.accentColor && config.colorConfig?.lightBaseColor && config.colorConfig?.anchorColor);
+  const paletteName = config.colorConfig?.paletteName || paletteNames[palette] || '清透明亮五角色色板';
+  const paletteInstruction = hasDerivedPalette ? `【色板，硬性条件】${paletteName}：主色 ${config.colorConfig?.primaryCustomColor} 仅作大背景与标题大色块；辅助色 ${config.colorConfig?.secondaryCustomColor} 仅作局部图形与层次；强调色 ${config.colorConfig?.accentColor} 仅标记关键词、数字、标签；浅底色 ${config.colorConfig?.lightBaseColor} 承接信息区与色块缓冲；深锚点 ${config.colorConfig?.anchorColor} 仅作描边、关键文字与局部阴影。必须使用以上五个色值，不得替换、遗漏或加入未指定的大面积颜色。主色 45%—60%、浅底 20%—30%、辅助 10%—20%、强调 5%—10%、深锚点不超过 8%；以浅底色缓冲色块，避免大面积强互补撞色。${config.colorConfig?.foilEffect === 'gold' ? '标题、数字或细边框采用明亮平面假烫金渐变，禁止暗金和立体反光。' : ''}${config.colorConfig?.foilEffect === 'silver' ? '标题、数字或细边框采用清透明亮平面假烫银渐变，禁止暗灰和镜面反光。' : ''}` : '';
+  const secondaryColor = config.colorConfig?.secondaryColor;
+  const whiteSecondaryConstraint = secondaryColor === 'white' ? '【白色辅助色，硬性条件】辅助色必须使用纯白 #FFFFFF，保持不透明、干净中性；不得与主色半透明叠加，不得渲染为粉白、浅珊瑚红、米粉或任何有色白。' : '';
   const points = Array.isArray(facts.sellingPoints) ? facts.sellingPoints.map(item => typeof item === 'string' ? item : item?.text).filter(Boolean) : String(demand.selling || '').split(/\n+/).map(item => item.trim()).filter(Boolean);
   const confirmedCopy = [
     `主标题：${edits.title || facts.headline || demand.title || ''}`,
@@ -817,48 +1036,148 @@ function promptModules(demand, materialType, edits = {}) {
     `卖点：${edits.selling || points.join('；') || '无'}`
   ].join('；');
   const spec = canvasSpec(edits.canvasSpec || demand.materialCanvasSpecs?.[materialType] || demand.canvasSpec || edits.ratio || demand.ratio || '7:10');
-  const blueprint = config.presetConfig?.promptBlueprint;
   const visual = [
     `【定位】${visualPreferenceLabels[config.audienceConfig?.visualPreference] || '教育课程风格'}，${marketingIntensityLabels[config.audienceConfig?.marketingIntensity] || marketingIntensityLabels.none}`,
     `【画幅】${spec.ratio}，完整安全边距`,
-    `【字体】${titleStyleLabels[config.titleTypographyConfig?.titleStyle] || '现代粗体'}，${titleWeightLabels[config.titleTypographyConfig?.titleWeight] || '粗体'}`,
-    `【配色】${colorLabel(config.colorConfig?.primaryColor, config.colorConfig?.primaryCustomColor)} + ${colorLabel(config.colorConfig?.secondaryColor, config.colorConfig?.secondaryCustomColor)}，高明度高对比`,
+    `【字体】${titleStyleLabels[titleStyleKey] || titleStyleLabels.title_rounded_outline}，${titleWeightLabels[config.titleTypographyConfig?.titleWeight] || '粗体'}`,
+    `【配色】${hasDerivedPalette ? paletteName : `${colorLabel(config.colorConfig?.primaryColor, config.colorConfig?.primaryCustomColor)} + ${colorLabel(config.colorConfig?.secondaryColor, config.colorConfig?.secondaryCustomColor)}`}，明亮清透、层级分明`,
     `【主体】${illustrationStyleLabels[illustration.illustrationStyle] || '明亮图形插画'}，${subjectTypeLabels[illustration.subjectType] || '学习元素'}${photoSubject ? '；仅一个授权真人讲师' : ''}`,
-    decoration.coverElement && decoration.coverElement !== 'none' ? `【装饰】${coverElementLabels[decoration.coverElement]}` : '',
-    blueprint?.layout ? `【案例结构】${blueprint.layout}` : ''
+    decoration.coverElement && decoration.coverElement !== 'none' ? `【装饰】${coverElementLabels[decoration.coverElement]}` : ''
   ].filter(Boolean).join('\n');
   const basePositive = materialType === '主视觉' ? mainVisualBasePositive : materialBasePositive;
   const rawDetail = edits.designNote || demand.designNote || demand.constraints?.freeformDesignNote || '';
   const detail = rawDetail === config.presetConfig?.caseGuidance ? '' : rawDetail;
-  const badgePosition = demand.textRenderConfig?.previewPositions?.previewBadge || { left: 76, top: 6 };
-  const hasBadge = Boolean(demand.assetBindings?.badgeAssetId || demand.assetBindings?.badgeTwoAssetId);
-  const badgeInstruction = hasBadge
-    ? `【徽章后置】徽章由系统后置叠加；在画幅 ${Math.round(Number(badgePosition.left) || 76)}%,${Math.round(Number(badgePosition.top) || 6)}% 处仅预留无文字、无图标的干净位置，位置必须自然延续周围背景的颜色、纹理、光感和视觉风格，不得额外添加色块、白底、底牌、边框、阴影、认证章、飘带或任何替代装饰。`
-    : '';
+  const badgeInstruction = badgeReservationInstruction(demand.assetBindings || {}, previewPositions);
   const hasIpReference = Boolean(demand.assetBindings?.ipAssetId);
-  const referenceInstruction = hasIpReference
-    ? '【主体参考图，硬性条件】输入的画幅预览中已包含上传 IP。必须保留该 IP 的物种、脸型、五官比例、毛色、服装、帽子、姿态和材质特征，不得替换成其他动物、角色或通用卡通形象。'
-    : '';
-  return { confirmedCopy, visual, detail, badgeInstruction, referenceInstruction, canvasSpec: spec, basePositive, baseNegative: commonNegativePrompt, ...layoutComponentModules(config, points, demand.textRenderConfig?.previewPositions || {}) };
+  const referenceRoles = [...new Set((demand.referenceAssets || []).flatMap(asset => Array.isArray(asset?.role) ? asset.role : [asset?.role]).filter(Boolean))];
+  const referenceRoleInstructions = {
+    layout: '结构与版式参考图仅继承大色块分区、模块比例、标题/主体/卖点的相对关系、图形承托和阅读动线，不继承其角色、配色、文字或品牌',
+    overall_style: '图形语言参考图仅继承插画笔触或几何语言、装饰密度、层叠方式与扁平质感，不继承构图、角色、文字或色彩',
+    illustration: hasIpReference ? '主体动作参考图仅继承姿态、镜头角度与动作节奏；角色身份、外形、服装和材质必须以已上传 IP 为准' : '主体动作参考图仅继承主体姿态、镜头角度与图形语言，不继承其文字、品牌或背景结构',
+    palette: '色彩氛围参考图仅作为明暗层次和配色比例参考；所有实际颜色必须严格使用当前已选五角色色板，不继承原图色值'
+  };
+  const referenceRules = referenceRoles.map(role => referenceRoleInstructions[role]).filter(Boolean);
+  const referenceInstruction = [
+    hasIpReference ? '【主体参考图，硬性条件】输入的画幅预览中已包含上传 IP。必须保留该 IP 的物种、脸型、五官比例、毛色、服装、帽子、姿态和材质特征，不得替换成其他动物、角色或通用卡通形象。' : '',
+    referenceRules.length ? `【上传参考图，硬性条件】本次图像编辑会同时传入画幅预览与${referenceRoles.join('、')}参考图。${referenceRules.join('；')}；不得复制参考图中的文字、人物、Logo 或徽章。` : ''
+  ].filter(Boolean).join('\n');
+  const designNoteLayout = explicitLayoutInstruction(detail);
+  const imageGenerationInstruction = [
+    `【生图优先级】正式文案、已选五角色色板、上传 IP 身份与安全留白不可被参考图覆盖；结构与版式参考只控制模块关系，图形语言参考只控制插画质感，${designNoteLayout ? '设计说明中的明确位置要求优先于旧画幅锚点。' : '画幅预览只校正当前拖拽位置。'}`,
+    paletteInstruction,
+    '【营销层级】主标题为第一注意力，副标题/年级标签为第二信息层，主体与视觉元素为第三视觉层，卖点为可扫读转化层；用对齐、留白、路径和背景分区连成清晰动线，不做简单模板或PPT示意。',
+    '【平面质感】全画面为干净平面、清透印刷插画或清晰摄影拼贴，不使用纸张颗粒、磨砂、脏灰渐变、厚重金属或无关写实材质。'
+  ].filter(Boolean).join('\n');
+  return { confirmedCopy, visual, titleStyleConstraint, whiteSecondaryConstraint, paletteInstruction, imageGenerationInstruction, detail, badgeInstruction, referenceInstruction, canvasSpec: spec, basePositive, baseNegative: commonNegativePrompt, ...layoutComponentModules(config, points, previewPositions, demand.referenceAssets || [], designNoteLayout) };
+}
+
+function promptSkillInput(modules, materialType, referenceAssets = []) {
+  return {
+    task: `${materialType}生图补充词；最终完整 Prompt 将由服务端合并，请勿重复输入文案和规则。`,
+    confirmedCopy: modules.confirmedCopy,
+    visualDirection: modules.visual,
+    titleConstraint: modules.titleStyleConstraint,
+    layoutConstraint: [modules.hardLayout, modules.imageLayout].filter(Boolean).join('\n'),
+    paletteConstraint: [modules.paletteInstruction, modules.whiteSecondaryConstraint].filter(Boolean).join('\n'),
+    designNote: modules.detail ? '将以下意图润色扩展为可见画面关系，不得原样照抄：' + modules.detail : '',
+    badgeConstraint: modules.badgeInstruction,
+    referenceConstraint: modules.referenceInstruction,
+    referenceRoles: referenceAssets.map(asset => asset.role).filter(Boolean),
+    outputLimit: 'positivePrompt 120—240 字；只补足主体、装饰、层级、材质与气质。'
+  };
 }
 
 function appendPromptModules(prompt, modules) {
-  return [
+  const combined = [
     `【文案】${modules.confirmedCopy}`,
     '【文字白名单】画面只允许出现【文案】中逐字提供的中文、数字和英文；除此之外不出现任何标题、口号、课程名、认证、标签、数字、英文、Logo、水印或装饰文字。',
+    modules.badgeInstruction,
     `【画面基调】${modules.basePositive}`,
     modules.visual,
-    modules.hardLayout,
+    modules.titleStyleConstraint,
+    prompt,
+    modules.whiteSecondaryConstraint,
+    modules.paletteInstruction,
+    modules.imageLayout,
+    modules.referenceInstruction
+  ].filter(Boolean);
+  return joinPromptSections(combined);
+}
+
+function joinPromptSections(sections, limit = 2000) {
+  const output = [];
+  let length = 0;
+  for (const raw of sections) {
+    const section = String(raw || '').trim();
+    if (!section || length + section.length + (output.length ? 1 : 0) > limit) continue;
+    output.push(section);
+    length += section.length + (output.length > 1 ? 1 : 0);
+  }
+  return output.join('\n');
+}
+
+function limitFinalPrompt(value) {
+  return joinPromptSections(String(value || '').split('\n'));
+}
+
+function buildImageGenerationPrompt(prompt, modules, modelSupplement = '') {
+  const combined = [
+    `【文案】${modules.confirmedCopy}`,
+    '【文字白名单】只出现以上已确认文案；不添加任何其他文字、数字、英文、Logo、水印、徽章或认证。',
     modules.badgeInstruction,
-    modules.referenceInstruction,
-    modules.detail ? `【补充】${modules.detail}` : '',
-    prompt
-  ].filter(Boolean).join('\n');
+    String(modelSupplement || '').trim(),
+    modules.titleStyleConstraint,
+    modules.imageLayout,
+    modules.paletteInstruction,
+    modules.referenceInstruction
+  ].filter(Boolean);
+  return joinPromptSections(combined, maxImageEditPromptLength);
 }
 
 function compactNegativePrompt(...parts) {
   const unique = [...new Set(parts.join('；').split(/[；。\n]/).map(item => item.trim()).filter(Boolean))];
   return unique.slice(0, 14).join('；').slice(0, 280);
+}
+
+const builtInPaletteFallbacks = [
+  { name: '蓝黄学院调', hint: '国际、可信、少儿英语', primary: '#4D79D8', secondary: '#8ED8F8', accent: '#FFC83D', light: '#FFF8E8', anchor: '#284B9B' },
+  { name: '橙蓝活力调', hint: '数学、全科、成长感', primary: '#FF6A32', secondary: '#35B9E8', accent: '#FFD34E', light: '#FFF5E7', anchor: '#1E4F9E' },
+  { name: '红杏轻促销调', hint: '冲刺、直播、短期提分', primary: '#F34435', secondary: '#FF9D6B', accent: '#FFD567', light: '#FFF4E8', anchor: '#9F2631' },
+  { name: '紫橙趣味调', hint: '自然拼读、萌系 IP、启蒙', primary: '#6855B6', secondary: '#B6A5E6', accent: '#FFB745', light: '#FFF7C8', anchor: '#403579' },
+  { name: '青绿暖黄调', hint: '语文、文化、清新学习感', primary: '#22A8B8', secondary: '#73D1C4', accent: '#FFC95A', light: '#F4FBF3', anchor: '#1E6075' }
+];
+
+function paletteLuminance(hex) {
+  const value = String(hex || '').replace('#', '');
+  if (!/^[0-9a-f]{6}$/i.test(value)) return 0;
+  const channels = [0, 2, 4].map(index => parseInt(value.slice(index, index + 2), 16) / 255).map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+  return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+}
+
+function paletteFallbackForTone(tone) {
+  const text = String(tone || '');
+  const palette = /红|直播|冲刺|促销|提分/.test(text) ? builtInPaletteFallbacks[2]
+    : /绿|青|薄荷|自然|语文|文化|清新/.test(text) ? builtInPaletteFallbacks[4]
+      : /紫|萌|启蒙|拼读|趣味|IP/.test(text) ? builtInPaletteFallbacks[3]
+        : /橙|数学|成长|活力/.test(text) ? builtInPaletteFallbacks[1]
+          : builtInPaletteFallbacks[0];
+  return { ...palette, id: 'ai_generated', name: `AI ${palette.name}`, hint: `按“${text.slice(0, 20) || palette.hint}”生成的明亮五角色色板` };
+}
+
+function sanitizeAiPalette(result, tone) {
+  const fallback = paletteFallbackForTone(tone);
+  const colors = ['primary', 'secondary', 'accent', 'light', 'anchor'];
+  const palette = { ...fallback };
+  for (const key of colors) {
+    const value = String(result?.[key] || '').trim().toUpperCase();
+    if (!/^#[0-9A-F]{6}$/.test(value)) return { palette: fallback, fallback: true };
+    palette[key] = value;
+  }
+  const distinct = new Set(colors.map(key => palette[key])).size === colors.length;
+  if (!distinct || paletteLuminance(palette.light) < 0.78 || paletteLuminance(palette.anchor) > 0.24 || paletteLuminance(palette.primary) < 0.1 || paletteLuminance(palette.primary) > 0.62) return { palette: fallback, fallback: true };
+  palette.name = `AI ${String(result?.name || '色调生成').replace(/[<>]/g, '').slice(0, 18)}`;
+  palette.hint = String(result?.hint || `按“${tone}”生成的明亮五角色色板`).replace(/[<>]/g, '').slice(0, 40);
+  return { palette, fallback: false };
 }
 
 function sanitizeStyleProfile(result) {
@@ -897,7 +1216,7 @@ async function normalizeGeneratedImage(storageName, size) {
   if (!target) return;
   const [targetWidth, targetHeight] = target.slice(1).map(Number);
   const source = join(uploadDir, storageName);
-  const inspect = (await execFileAsync('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', source])).stdout;
+  const inspect = (await execFileAsync('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', source], sipsOptions)).stdout;
   const width = Number(inspect.match(/pixelWidth:\s*(\d+)/)?.[1]);
   const height = Number(inspect.match(/pixelHeight:\s*(\d+)/)?.[1]);
   if (!width || !height) throw new Error('无法识别图像服务返回的尺寸。');
@@ -906,11 +1225,61 @@ async function normalizeGeneratedImage(storageName, size) {
   try {
     // Preserve the full provider image while matching the approved print ratio.
     // This avoids both crop loss and letterbox borders when native model ratios differ.
-    await execFileAsync('sips', ['--resampleHeightWidth', String(targetHeight), String(targetWidth), source, '--out', normalized]);
+    await execFileAsync('sips', ['--resampleHeightWidth', String(targetHeight), String(targetWidth), source, '--out', normalized], sipsOptions);
     await rename(normalized, source);
   } finally {
     await unlink(normalized).catch(() => {});
   }
+}
+
+async function prepareEditReference(reference, index) {
+  const source = join(uploadDir, `.edit-source-${randomUUID()}`);
+  const output = join(uploadDir, `.edit-reference-${randomUUID()}.jpg`);
+  try {
+    const base64 = reference.dataUrl.split(',')[1];
+    if (!base64) throw new Error(`参考图“${reference.fileName}”数据无效。`);
+    await writeFile(source, Buffer.from(base64, 'base64'));
+    // 图片接口经常拒绝超大 PNG、WebP 或带透明通道的多图请求。统一成保留完整画面的 JPEG，
+    // 可显著提高兼容性，且不会裁切用户上传的画幅或角色参考图。
+    await execFileAsync('sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '82', '-Z', String(imageEditReferenceEdge), source, '--out', output], sipsOptions);
+    const bytes = await readFile(output);
+    return { fileName: `${basename(reference.fileName, extname(reference.fileName)) || `reference-${index + 1}`}.jpg`, mimeType: 'image/jpeg', bytes, role: reference.role };
+  } finally {
+    await unlink(source).catch(() => {});
+    await unlink(output).catch(() => {});
+  }
+}
+
+function imageEditPrompt(prompt, selectedReferences = []) {
+  const imagePrompt = String(prompt.imagePrompt || '').trim();
+  const detail = String(prompt.positivePrompt || '').trim();
+  const negative = String(prompt.negativePrompt || '').trim();
+  const core = imagePrompt || detail;
+  const roles = selectedReferences.map(reference => reference.role).filter(Boolean);
+  const hasLayoutReference = roles.includes('layout');
+  const hasIpReference = roles.includes('IP 参考');
+  const hasIllustrationReference = roles.includes('illustration');
+  const hasStyleReference = roles.includes('overall_style');
+  const hasPaletteReference = roles.includes('palette');
+  const referenceUse = [
+    hasLayoutReference ? '结构与版式参考图只控制大色块分区、模块比例、标题/主体/卖点相对关系与阅读节奏；替换为本项目正式文案、上传 IP 与后置徽章。' : '',
+    roles.includes('画幅预览')
+      ? '画幅预览只校正本项目文字、主体与卖点的实际拖拽落点，不改变参考图的结构职责。'
+      : '当前画幅预览的拖拽坐标已写入文字约束，只校正本项目文字、主体与卖点落点，不改变其他参考图的结构职责。',
+    hasIpReference ? 'IP 参考图唯一决定角色身份、外形、服装与材质。' : '',
+    hasIllustrationReference ? (hasIpReference ? '主体动作参考图只提供姿态与动作节奏，不替换 IP 身份。' : '主体动作参考图决定角色姿态与镜头角度。') : '',
+    hasStyleReference ? '图形语言参考图只提供插画语言、装饰密度与层叠方式，不改变构图、角色或色板。' : '',
+    hasPaletteReference ? '色彩氛围参考图只提供明暗层次与面积比例；实际颜色只使用网站已选色板。' : ''
+  ].filter(Boolean).join('');
+  const guardrails = [
+    roles.length ? `本次已传入参考图：${roles.join('、')}。` : '',
+    referenceUse,
+    '只呈现已确认文案，禁止添加任何额外文字、数字、英文、Logo、水印或徽章；徽章仅留自然背景空位。',
+    '整体高明度高对比，主体四周保留至少 12% 同风格背景呼吸余量。'
+  ].join('');
+  // Put reference priority first so it survives the provider prompt limit.
+  const compact = `${guardrails}${core}${negative ? `避免：${negative}` : ''}`;
+  return compact.length <= maxImageEditPromptLength ? compact : `${compact.slice(0, maxImageEditPromptLength - 1)}。`;
 }
 
 function imageTimeoutMs() { return Number(process.env.CCPROXY_IMAGE_TIMEOUT_MS || 180000); }
@@ -920,15 +1289,11 @@ async function requestGeneratedImage({ projectId, prompt, model, apiKey, parentV
   const requestedSize = String(prompt.size || '');
   if (!/^\d{3,5}x\d{3,5}$/.test(requestedSize)) throw badRequest('缺少与当前设计画幅一致的模型生成尺寸。');
   const storedIds = Array.isArray(prompt.referenceAssetIds) ? prompt.referenceAssetIds : [];
-  // The canvas preview anchors text regions and composition; pair it with the
-  // IP/style references so edit generation can preserve both layout and subject.
+  // A prompt owns the complete reference set used for its image task. This
+  // prevents later uploads from changing a queued task while ensuring canvas,
+  // IP, layout and style references travel together to the image endpoint.
   const currentIds = currentReferenceAssets(projectId, ['画幅预览', 'IP 参考', 'overall_style', 'layout', 'illustration', 'palette']).map(asset => asset.id);
-  // A prompt owns its reference list. Later uploads must not silently rewrite
-  // a queued generation, while deleted files naturally drop out on lookup.
-  // Keep older Prompt versions compatible: before preview references were
-  // persisted, their saved list only contained the subject/style image.
-  const previewIds = currentReferenceAssets(projectId, ['画幅预览']).map(asset => asset.id);
-  const referenceIds = storedIds.length ? [...new Set([...previewIds, ...storedIds])] : currentIds;
+  const referenceIds = storedIds.length ? storedIds : currentIds;
   const references = await loadReferenceAssets(projectId, referenceIds.slice(0, maxImageReferences));
   const visualIds = [...new Set([...(Array.isArray(prompt.referenceVisualIds) ? prompt.referenceVisualIds : []), parentVisualId].filter(Boolean))].slice(0, 4);
   for (const visualId of visualIds.reverse()) {
@@ -937,51 +1302,70 @@ async function requestGeneratedImage({ projectId, prompt, model, apiKey, parentV
   }
   references.splice(maxImageReferences);
   if (references.length) {
-    // Several compatible providers silently consume only the final multipart
-    // file. The saved preview is a flattened, single source of truth: it
-    // contains the placed IP, official copy zones and composition together.
-    const previewReference = references.filter(asset => asset.role === '画幅预览').slice(0, 1);
-    const ipReference = references.filter(asset => asset.role === 'IP 参考').slice(0, 1);
-    const editReferences = previewReference.length ? previewReference : (ipReference.length ? ipReference : references.slice(0, 1));
-    const editWithField = async imageField => {
+    // The first multipart image often has the strongest influence. When a
+    // designer supplies a layout reference, make it the base image while still
+    // providing the live preview and IP in the same edit request.
+    const roleOrder = references.some(asset => asset.role === 'layout')
+      ? { layout: 0, 'IP 参考': 1, illustration: 2, overall_style: 3, palette: 4, '画幅预览': 5 }
+      : { '画幅预览': 0, 'IP 参考': 1, illustration: 2, overall_style: 3, palette: 4 };
+    const sortedReferences = [...references].sort((left, right) => (roleOrder[left.role] ?? 9) - (roleOrder[right.role] ?? 9));
+    const selectedReferences = sortedReferences.slice(0, maxEditReferenceImages);
+    const previewReference = sortedReferences.find(asset => asset.role === '画幅预览') || sortedReferences[0];
+    const preparedReferences = await Promise.all(selectedReferences.map(prepareEditReference));
+    const preparedPreview = preparedReferences[selectedReferences.indexOf(previewReference)] || await prepareEditReference(previewReference, 0);
+    const generationPrompt = imageEditPrompt(prompt, selectedReferences);
+    const editWithField = async ({ imageField, assets, compact }) => {
       const form = new FormData();
       form.set('model', model);
-      form.set('prompt', prompt.positivePrompt);
+      form.set('prompt', generationPrompt);
       form.set('size', requestedSize);
       form.set('n', '1');
       form.set('response_format', 'b64_json');
-      form.set('input_fidelity', process.env.CCPROXY_IMAGE_INPUT_FIDELITY || 'high');
-      for (const reference of editReferences) {
-        const base64 = reference.dataUrl.split(',')[1];
-        form.append(imageField, new Blob([Buffer.from(base64, 'base64')], { type: reference.mimeType }), reference.fileName);
+      if (!compact) form.set('input_fidelity', process.env.CCPROXY_IMAGE_INPUT_FIDELITY || 'high');
+      for (const reference of assets) {
+        form.append(imageField, new Blob([reference.bytes], { type: reference.mimeType }), reference.fileName);
       }
       return fetchWithTimeout(providerUrl('/images/edits'), { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form }, imageTimeoutMs(), '引用参考图生成');
     };
-    // Compatible image services disagree on whether repeated files use image[]
-    // or image. Try both before any text-only fallback, preserving references.
+    // Compatible providers vary in accepted multipart field names, file counts
+    // and optional parameters. Each fallback still carries a reference image;
+    // the final single-image fallback uses the saved canvas preview, which is
+    // the source of truth for the placed IP and the approved composition.
     const configuredField = process.env.CCPROXY_EDIT_IMAGE_FIELD;
-    const imageFields = configuredField ? [configuredField] : ['image[]', 'image'];
-    logHistory(projectId, 'image_job_reference_source', '使用单张画幅参考图生成', { jobId, sourceRoles: editReferences.map(asset => asset.role), availableRoles: references.map(asset => asset.role) });
+    const imageFields = [...new Set([configuredField, 'image[]', 'image'].filter(Boolean))];
+    const attempts = [
+      ...imageFields.map(imageField => ({ imageField, assets: preparedReferences, compact: false, label: '多图高保真' })),
+      ...imageFields.map(imageField => ({ imageField, assets: [preparedPreview], compact: true, label: '画幅预览单图兼容' }))
+    ];
+    logHistory(projectId, 'image_job_reference_source', '使用压缩兼容的任务冻结参考图集生成', { jobId, sourceRoles: selectedReferences.map(asset => asset.role), referenceAssetIds: referenceIds, editReferenceEdge: imageEditReferenceEdge, imageEditPromptLength: generationPrompt.length });
     let lastError = null;
-    for (let index = 0; index < imageFields.length; index += 1) {
-      const editResponse = await editWithField(imageFields[index]);
-      if (editResponse.ok) return editResponse;
-      lastError = providerFailure('引用参考图生成', editResponse.status, await editResponse.text());
-      // A safety rejection applies to the edit request's input image, not
-      // necessarily to the approved project copy. Preserve the job by using
-      // the final text prompt in the regular generation endpoint instead.
-      if (editResponse.status < 500 && editResponse.status !== 400) throw lastError;
-      if (index < imageFields.length - 1 && jobId) db.prepare('UPDATE image_jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
-        .run('生成中', '正在切换参考图兼容模式，继续保留画幅预览与主体参考图。', now(), jobId);
+    for (let index = 0; index < attempts.length; index += 1) {
+      const attempt = attempts[index];
+      const editResponse = await editWithField(attempt);
+      if (editResponse.ok) {
+        logHistory(projectId, 'image_job_reference_applied', '参考图编辑请求已成功提交', {
+          jobId,
+          mode: attempt.label,
+          submittedRoles: attempt.assets.map(asset => asset.role),
+          submittedReferenceCount: attempt.assets.length,
+          layoutReferencePrioritized: selectedReferences.some(asset => asset.role === 'layout')
+        });
+        return editResponse;
+      }
+      const detail = await editResponse.text();
+      lastError = providerFailure('引用参考图生成', editResponse.status, detail);
+      const isSafetyRejection = /safety|moderation|content[ _-]?policy|policy violation|违规|审核|色情|暴力|仇恨|未成年人/i.test(detail);
+      if (isSafetyRejection || (editResponse.status < 500 && ![400, 404, 405, 415, 422].includes(editResponse.status))) throw lastError;
+      if (index < attempts.length - 1 && jobId) db.prepare('UPDATE image_jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
+        .run('生成中', `参考图接口兼容中：正在切换至${attempts[index + 1].label}。`, now(), jobId);
     }
-    if (jobId) db.prepare('UPDATE image_jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
-      .run('生成中', lastError?.providerStatus === 400 ? '参考图编辑未通过审核，已保留文案与版式约束并改用稳定生成模式。' : '参考图编辑服务暂不可用，已改用稳定生成模式。', now(), jobId);
-    logHistory(projectId, 'image_job_fallback', lastError?.providerStatus === 400 ? '参考图编辑审核未通过，改用普通生成' : '参考图编辑失败，改用普通生成', { jobId, providerStatus: lastError?.providerStatus || 0 });
+    logHistory(projectId, 'image_job_reference_failed', '参考图编辑兼容请求均失败，未降级为纯文字生图', { jobId, providerStatus: lastError?.providerStatus || 0, referenceAssetIds: referenceIds, attemptedFields: imageFields });
+    throw lastError || new Error('参考图编辑服务未返回可用结果。');
   }
   return fetchWithTimeout(providerUrl('/images/generations'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model, prompt: prompt.positivePrompt, size: requestedSize, n: 1, response_format: 'b64_json' })
+    body: JSON.stringify({ model, prompt: prompt.imagePrompt || prompt.positivePrompt, size: requestedSize, n: 1, response_format: 'b64_json' })
   }, imageTimeoutMs(), '图像模型调用');
 }
 
@@ -1079,6 +1463,23 @@ async function apiHandler(request, response, pathname) {
 
   if (request.method === 'GET' && pathname === '/api/health') {
     return send(response, 200, { ok: true, apiKeyConfigured: Boolean(process.env.CCPROXY_API_KEY), imageModel: process.env.CCPROXY_IMAGE_MODEL || 'gpt-image-2', editImageField: process.env.CCPROXY_EDIT_IMAGE_FIELD || 'image[]' });
+  }
+  if (request.method === 'POST' && pathname === '/api/palettes/generate') {
+    const body = await readJson(request);
+    const tone = String(body.tone || '').replace(/[<>]/g, '').trim().slice(0, 120);
+    if (!tone) throw badRequest('请先输入希望生成的色调描述。');
+    let palette;
+    let source = 'ai';
+    try {
+      const generated = sanitizeAiPalette(await callChatJson(paletteSkill, { tone, usage: '小学课程礼盒封面', requiredRoles: ['主色', '辅助色', '强调色', '浅底色', '深锚点色'] }, [], Number(process.env.CCPROXY_PALETTE_TIMEOUT_MS || 18000)), tone);
+      palette = generated.palette;
+      if (generated.fallback) source = 'rule_fallback';
+    } catch (error) {
+      source = 'rule_fallback';
+      palette = paletteFallbackForTone(tone);
+      console.warn(`[palette] AI palette generation unavailable; using bright fallback: ${String(error.message || error).slice(0, 180)}`);
+    }
+    return send(response, 200, { palette, source, tone });
   }
   if (request.method === 'GET' && pathname === '/api/skills/prompt') {
     return send(response, 200, {
@@ -1239,18 +1640,14 @@ async function apiHandler(request, response, pathname) {
     const body = await readJson(request);
     const demand = latestDemand(projectId);
     if (!demand) throw badRequest('请先保存需求。');
-    const payload = parse(demand.payload, {});
+    const payload = demand.payload || {};
     const positions = payload.visualConfig?.textRenderConfig?.previewPositions || {};
-    const normalizePosition = (value, fallback) => ({
-      left: Math.max(0, Math.min(100, Number(value?.left ?? fallback.left))),
-      top: Math.max(0, Math.min(100, Number(value?.top ?? fallback.top)))
-    });
     payload.visualConfig = payload.visualConfig || {};
     payload.visualConfig.textRenderConfig = payload.visualConfig.textRenderConfig || {};
     payload.visualConfig.textRenderConfig.previewPositions = {
       ...positions,
-      previewBadge: normalizePosition(body.previewBadge, positions.previewBadge || { left: 76, top: 6 }),
-      previewBadgeTwo: normalizePosition(body.previewBadgeTwo, positions.previewBadgeTwo || { left: 6, top: 76 })
+      previewBadge: normalizedBadgeRect(body.previewBadge, positions.previewBadge || { left: 76, top: 6, ...defaultBadgeRect }),
+      previewBadgeTwo: normalizedBadgeRect(body.previewBadgeTwo, positions.previewBadgeTwo || { left: 6, top: 76, ...defaultBadgeRect })
     };
     payload.visualConfig.badgeConfig = {
       ...(payload.visualConfig.badgeConfig || {}),
@@ -1290,6 +1687,7 @@ async function apiHandler(request, response, pathname) {
   if (request.method === 'POST' && badgeSettingsMatch) {
     const body = await readJson(request);
     const projectId = badgeSettingsMatch[1];
+    if (!db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId)) return send(response, 404, { error: '项目不存在' });
     const asset = body.badgeAssetId ? db.prepare("SELECT * FROM reference_assets WHERE id = ? AND project_id = ? AND role = '徽章'").get(body.badgeAssetId, projectId) : null;
     if (body.badgeAssetId && !asset) throw badRequest('请选择当前项目已上传的徽章图片。');
     const positions = new Set(['左上角', '右上角', '左下角', '右下角']);
@@ -1311,15 +1709,24 @@ async function apiHandler(request, response, pathname) {
     const bytes = Buffer.from(match[2], 'base64');
     if (bytes.length > maxReferenceSize) throw badRequest('单张参考图不能超过 10MB。');
     if (!isImageBytes(bytes, body.mimeType)) throw badRequest('上传文件与声明的图片格式不一致。');
+    const role = body.role === undefined || body.role === null ? '风格参考' : body.role;
+    if (!allowedAssetRoles.has(role)) throw badRequest('参考图用途无效。');
     ensureProject(body.projectId, body.demand || {});
     const assetId = id('asset');
     const extension = match[1] === 'image/jpeg' ? '.jpg' : match[1] === 'image/webp' ? '.webp' : '.png';
     const storageName = `${assetId}${extension}`;
     await writeFile(join(uploadDir, storageName), bytes);
-    db.prepare('INSERT INTO reference_assets (id, project_id, file_name, mime_type, byte_size, role, authorized, storage_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(assetId, body.projectId, basename(body.name), body.mimeType, bytes.length, body.role || '风格参考', 1, storageName, now());
-    logHistory(body.projectId, 'reference_uploaded', '上传参考图', { assetId, role: body.role || '风格参考' });
-    return send(response, 201, { id: assetId, name: basename(body.name), role: body.role || '风格参考', authorized: true, url: `/uploads/${storageName}` });
+    // The file is already on disk, so anything that throws from here on has to
+    // take it back out or it becomes an orphan no part of the app can see.
+    try {
+      db.prepare('INSERT INTO reference_assets (id, project_id, file_name, mime_type, byte_size, role, authorized, storage_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(assetId, body.projectId, basename(body.name), body.mimeType, bytes.length, role, 1, storageName, now());
+    } catch (error) {
+      await unlink(join(uploadDir, storageName)).catch(() => {});
+      throw error;
+    }
+    logHistory(body.projectId, 'reference_uploaded', '上传参考图', { assetId, role });
+    return send(response, 201, { id: assetId, name: basename(body.name), role, authorized: true, url: `/uploads/${storageName}` });
   }
   if (request.method === 'DELETE' && referenceAssetMatch) {
     const asset = db.prepare('SELECT * FROM reference_assets WHERE id = ?').get(referenceAssetMatch[1]);
@@ -1328,7 +1735,7 @@ async function apiHandler(request, response, pathname) {
       db.prepare('UPDATE badge_settings SET badge_asset_id = NULL, updated_at = ? WHERE project_id = ? AND badge_asset_id = ?').run(now(), asset.project_id, asset.id);
       const demand = latestDemand(asset.project_id);
       if (demand) {
-        const payload = parse(demand.payload, {});
+        const payload = demand.payload || {};
         const bindings = payload.assetBindings || {};
         if (bindings.badgeAssetId === asset.id) bindings.badgeAssetId = null;
         if (bindings.badgeTwoAssetId === asset.id) bindings.badgeTwoAssetId = null;
@@ -1387,25 +1794,79 @@ async function apiHandler(request, response, pathname) {
       : currentReferenceAssets(proposal.project_id, ['画幅预览', 'IP 参考', '徽章', 'overall_style', 'layout', 'illustration', 'palette']);
     const referencePriority = { 'IP 参考': 0, illustration: 1, layout: 2, overall_style: 3, palette: 4 };
     const modelReferenceAssets = generationAssets.filter(asset => !['徽章', '画幅预览'].includes(asset.role));
+    const hasLayoutReference = generationAssets.some(asset => asset.role === 'layout');
+    const imageRoleOrder = hasLayoutReference
+      ? { layout: 0, 'IP 参考': 1, illustration: 2, overall_style: 3, palette: 4, '画幅预览': 5 }
+      : { '画幅预览': 0, 'IP 参考': 1, illustration: 2, overall_style: 3, palette: 4 };
     const imageGenerationAssets = generationAssets
       .filter(asset => asset.role !== '徽章')
-      .sort((a, b) => ({ '画幅预览': 0, 'IP 参考': 1, illustration: 2, layout: 3, overall_style: 4, palette: 5 }[a.role] ?? 9) - ({ '画幅预览': 0, 'IP 参考': 1, illustration: 2, layout: 3, overall_style: 4, palette: 5 }[b.role] ?? 9));
+      .sort((a, b) => (imageRoleOrder[a.role] ?? 9) - (imageRoleOrder[b.role] ?? 9));
     const promptReferenceAssets = [...modelReferenceAssets].sort((a, b) => (referencePriority[a.role] ?? 9) - (referencePriority[b.role] ?? 9)).slice(0, maxPromptReferenceImages);
-    const promptVisionPreviews = await loadPromptVisionPreviews(promptReferenceAssets);
+    // Image understanding makes the text planning call much slower and is not
+    // required for fidelity: the original assets are sent to the image model.
+    // It can still be explicitly enabled for providers that support it well.
+    const promptVisionPreviews = usePromptVision ? await loadPromptVisionPreviews(promptReferenceAssets) : [];
     const badgeSettings = db.prepare('SELECT * FROM badge_settings WHERE project_id = ?').get(proposal.project_id);
     const badgeAsset = badgeSettings?.badge_asset_id ? db.prepare("SELECT * FROM reference_assets WHERE id = ? AND project_id = ? AND role = '徽章'").get(badgeSettings.badge_asset_id, proposal.project_id) : null;
     const materialType = String(body.materialType || '主视觉');
     const demandSnapshot = db.prepare('SELECT * FROM demand_snapshots WHERE id = ?').get(proposal.demand_snapshot_id);
     const demand = parse(demandSnapshot?.payload, {});
+    if (!String(demand.title || '').trim()) throw badRequest('当前需求没有主标题，请先保存填写完整的正式文案。');
     const skillDemand = compactDemandForSkill(demand);
     const modules = promptModules(demand, materialType, body.edits || {});
     const selectedSkill = materialType === '主视觉' ? promptSkill : materialPromptSkill;
-    const prompt = sanitizePrompt(await callChatJson(selectedSkill, { demand: skillDemand, proposal: proposalContent, materialType, seriesHierarchy: materialType === '主书' ? '主书为延展物料的一级信息载体，承接礼盒主视觉。' : '当前物料比主书弱一级，保持系列感但不得压过主书。', confirmedCopy: modules.confirmedCopy, visualModules: modules.visual, feedback: feedback ? { message: feedback.message } : null, designerEdits: body.edits || {}, parentVisual: parentVisual ? { id: parentVisual.id, materialType: parentVisual.material_type } : null, parentVisuals: parentVisuals.map(visual => ({ id: visual.id, materialType: visual.material_type })), referenceAssets: promptReferenceAssets.map(asset => ({ fileName: asset.file_name, role: asset.role, analysis: asset.role === 'IP 参考' ? '识别并继承角色身份、外形、服装、姿态与表情；禁止提取图中文字。' : '识别并提取配色、构图、插图与图形语言；禁止复制图中文字、徽章或 Logo。' })), badge: badgeAsset ? { position: badgeSettings.position, sizeRatio: badgeSettings.size_ratio, marginRatio: badgeSettings.margin_ratio, instruction: '徽章由系统在后处理阶段精确叠加；图像模型仅保留无文字的纯色空白位置，不得重绘、替代、放大或复制徽章、Logo及其文字。' } : null }, promptVisionPreviews));
-    prompt.positivePrompt = appendPromptModules(prompt.positivePrompt, modules);
-    if (prompt.integratedPrompt) prompt.positivePrompt += `\n【整合版提示词】${prompt.integratedPrompt}`;
+    let prompt;
+    let usedRuleFallback = false;
+    let skillFailure = '';
+    const skillInput = promptSkillInput(modules, materialType, promptReferenceAssets);
+    try {
+      prompt = sanitizePrompt(await callChatJson(selectedSkill, skillInput, promptVisionPreviews, Number(process.env.CCPROXY_PROMPT_TIMEOUT_MS || 45000), { tokenLimit: Number(process.env.CCPROXY_PROMPT_MAX_TOKENS || 420), model: process.env.CCPROXY_PROMPT_MODEL || 'gpt-5.4', preferPlainJson: true }));
+      if (prompt.positivePrompt.length < 12) throw new Error('方案模型返回的 Skill 补充词为空。');
+    } catch (primaryError) {
+      try {
+        const recoveryInput = {
+          confirmedCopy: modules.confirmedCopy,
+          visualDirection: modules.visual,
+          titleConstraint: modules.titleStyleConstraint,
+          layoutConstraint: modules.imageLayout,
+          paletteConstraint: modules.paletteInstruction || modules.whiteSecondaryConstraint,
+          designNote: modules.detail || '',
+          outputLimit: '120—180 字，只输出可见设计补充。'
+        };
+        prompt = sanitizePrompt(await callChatJson(promptSkillRecovery, recoveryInput, [], Number(process.env.CCPROXY_PROMPT_RECOVERY_TIMEOUT_MS || 30000), { tokenLimit: Number(process.env.CCPROXY_PROMPT_RECOVERY_MAX_TOKENS || 320), model: process.env.CCPROXY_PROMPT_RECOVERY_MODEL || 'gpt-5.4', preferPlainJson: true }));
+        if (prompt.positivePrompt.length < 12) throw new Error('快速恢复 Skill 返回的补充词为空。');
+      } catch (recoveryError) {
+      // A generated prompt must not depend on a transient Skill-model failure:
+      // the deterministic modules already contain the saved design contract.
+      usedRuleFallback = true;
+      skillFailure = String(recoveryError.message || primaryError.message || '方案模型未返回有效内容。').slice(0, 180);
+      console.warn(`[prompt] Skill model unavailable; using rules fallback: ${skillFailure}`);
+      prompt = sanitizePrompt({
+        positivePrompt: '严格执行已确认文案、五角色色板、画幅预览位置、标题结构、卖点结构、主体参考和安全留白；只补足与当前版式协调的无文字视觉细节。',
+        negativePrompt: modules.negative,
+        titleText: demand.title || demand.projectFacts?.headline || ''
+      });
+      }
+    }
+    let modelSupplement = removeConflictingLayoutWording(removeVerbatimDesignNote(prompt.positivePrompt, modules.detail), modules.designNoteLayout);
+    if (modules.detail && modelSupplement.length < 12) {
+      usedRuleFallback = true;
+      skillFailure = 'Skill 未能将补充设计说明转化为可执行设计描述。';
+      modelSupplement = '以克制、清晰的层级关系强化当前补充设计意图，保持画面可读性与统一性。';
+    }
+    prompt.positivePrompt = appendPromptModules(modelSupplement, modules);
+    prompt.positivePrompt = limitFinalPrompt(prompt.positivePrompt);
     prompt.negativePrompt = compactNegativePrompt(prompt.negativePrompt, commonNegativePrompt, modules.negative);
-    prompt.referenceAssetIds = imageGenerationAssets.slice(0, maxImageReferences).map(asset => asset.id);
+    prompt.imagePrompt = buildImageGenerationPrompt(prompt, modules, modelSupplement);
+    const frozenImageReferences = imageGenerationAssets.slice(0, maxImageReferences);
+    prompt.referenceAssetIds = frozenImageReferences.map(asset => asset.id);
+    prompt.referenceInputs = frozenImageReferences.map(asset => ({ id: asset.id, role: asset.role, fileName: asset.fileName }));
     prompt.referenceVisualIds = parentVisuals.map(visual => visual.id);
+    prompt.generationMode = usedRuleFallback ? 'rule_fallback' : 'skill';
+    prompt.skillFailure = skillFailure || null;
+    prompt.designNoteRefined = Boolean(modules.detail && !usedRuleFallback);
+    prompt.designNoteSource = modules.detail || null;
+    prompt.designNoteExpansion = modules.detail ? modelSupplement : null;
     const materialBrief = materialType === '主视觉' ? null : db.prepare('SELECT * FROM material_briefs WHERE project_id = ? AND material_type = ?').get(proposal.project_id, materialType);
     const briefPayload = parse(materialBrief?.payload, {});
     const targetSpec = canvasSpec(body.edits?.canvasSpec || (materialType === '主视觉' ? demand.canvasSpec || demand.ratio : briefPayload.canvasSpec || briefPayload.ratio || demand.canvasSpec || demand.ratio));
@@ -1415,8 +1876,8 @@ async function apiHandler(request, response, pathname) {
     const promptId = id('prompt');
     db.prepare('INSERT INTO prompt_versions (id, project_id, proposal_id, parent_visual_id, material_type, content, design_revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(promptId, proposal.project_id, proposal.id, body.parentVisualId || null, materialType, json(prompt), designRevision, now());
-    logHistory(proposal.project_id, 'prompt_created', `生成${materialType} Prompt`, { promptId, proposalId: proposal.id, parentVisualId: body.parentVisualId || null, materialType, designRevision });
-    return send(response, 201, { id: promptId, content: prompt });
+    logHistory(proposal.project_id, 'prompt_created', `生成${materialType} Prompt`, { promptId, proposalId: proposal.id, parentVisualId: body.parentVisualId || null, materialType, designRevision, generationMode: prompt.generationMode });
+    return send(response, 201, { id: promptId, content: prompt, usedRuleFallback, skillFailure: skillFailure || null });
   }
   if (request.method === 'POST' && pathname === '/api/image-jobs') {
     const body = await readJson(request);
@@ -1561,7 +2022,12 @@ const server = createServer(async (request, response) => {
     send(response, 200, file, contentType);
   } catch (error) {
     if (error.code === 'ENOENT') return send(response, 404, { error: '资源不存在' });
-    send(response, error.status || 500, { error: error.message || '服务暂时不可用。' });
+    // Errors carrying a status are ours and their text is written for the user.
+    // Anything else is a raw Node exception whose message leaks internals such
+    // as the tester's absolute install path, so it only goes to the console.
+    if (error.status) return send(response, error.status, { error: error.message || '服务暂时不可用。' });
+    console.error('[unhandled]', error);
+    send(response, 500, { error: '服务暂时不可用。' });
   }
 });
 

@@ -7,6 +7,15 @@ const positions = (title, subject, selling = [13, 72]) => ({
   previewBadgeTwo: { left: 6, top: 76 }
 });
 
+const legacyTitleStyleMap = {
+  rounded_playful: 'title_rounded_outline',
+  block_building: 'title_massive_blocks',
+  geometric_modern: 'title_flat_book',
+  condensed_speed: 'title_diagonal_sprint',
+  scholarly_culture: 'title_flat_book',
+  inflated_3d: 'title_round_print'
+};
+
 const casePreset = (number, fileName, name, category, ratio, fields, guidance, previewPositions) => ({
   id: `built_in_case_${String(number).padStart(2, '0')}`,
   sourceVisualId: `case_${String(number).padStart(2, '0')}`,
@@ -45,7 +54,7 @@ const casePreset = (number, fileName, name, category, ratio, fields, guidance, p
     },
     valueConfig: { valueTier: fields.valueTier || 'balanced_reliable' },
     titleTypographyConfig: {
-      titleStyle: fields.titleStyle,
+      titleStyle: legacyTitleStyleMap[fields.titleStyle] || fields.titleStyle || 'title_rounded_outline',
       titleWeight: fields.titleWeight || 'black',
       titleDirection: fields.titleDirection || 'horizontal',
       // The editable baseline stays flat; designers can add an effect later
